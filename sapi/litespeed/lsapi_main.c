@@ -69,6 +69,19 @@
 
 #define SAPI_LSAPI_MAX_HEADER_LENGTH 2048
 
+/* Key for each cache entry is dirname(PATH_TRANSLATED).
+ *
+ * NOTE: Each cache entry config_hash contains the combination from all user ini files found in
+ *       the path starting from doc_root throught to dirname(PATH_TRANSLATED).  There is no point
+ *       storing per-file entries as it would not be possible to detect added / deleted entries
+ *       between separate files.
+ */
+typedef struct _user_config_cache_entry {
+    time_t expires;
+    HashTable user_config;
+} user_config_cache_entry;
+static HashTable user_config_cache;
+
 static int  lsapi_mode       = 0;
 static char *php_self        = "";
 static char *script_filename = "";
@@ -76,6 +89,7 @@ static int  source_highlight = 0;
 static int  ignore_php_ini   = 0;
 static char * argv0 = NULL;
 static int  engine = 1;
+static int  parse_user_ini   = 0;
 #ifdef ZTS
 zend_compiler_globals    *compiler_globals;
 zend_executor_globals    *executor_globals;
@@ -86,10 +100,19 @@ void ***tsrm_ls;
 
 zend_module_entry litespeed_module_entry;
 
+static void init_sapi_from_env(sapi_module_struct *sapi_module)
+{
+    char *p;
+    p = getenv("LSPHPRC");
+    if (p)
+        sapi_module->php_ini_path_override = p;
+}
+
 /* {{{ php_lsapi_startup
  */
 static int php_lsapi_startup(sapi_module_struct *sapi_module)
 {
+    init_sapi_from_env(sapi_module);
     if (php_module_startup(sapi_module, NULL, 0)==FAILURE) {
         return FAILURE;
     }
@@ -184,6 +207,8 @@ static int sapi_lsapi_deactivate(void)
 
 
 /* {{{ sapi_lsapi_getenv
+ *
+ * @param name_len always ignored
  */
 static char *sapi_lsapi_getenv( char * name, size_t name_len )
 {
@@ -549,12 +574,16 @@ static int lsapi_execute_script( zend_file_handle * file_handle)
 
 }
 
+static int lsapi_activate_user_ini(void);
 
 static int lsapi_module_main(int show_source)
 {
     zend_file_handle file_handle = {0};
 
     if (php_request_startup() == FAILURE ) {
+        return -1;
+    }
+    if (lsapi_activate_user_ini() == FAILURE) {
         return -1;
     }
     if (show_source) {
@@ -611,6 +640,283 @@ static int alter_ini( const char * pKey, int keyLen, const char * pValue, int va
     return 1;
 }
 
+static void user_config_cache_entry_dtor(zval *el)
+{
+    user_config_cache_entry *entry = (user_config_cache_entry *)Z_PTR_P(el);
+    zend_hash_destroy(&entry->user_config);
+    free(entry);
+}
+
+static void user_config_cache_init()
+{
+    zend_hash_init(&user_config_cache, 0, NULL, user_config_cache_entry_dtor, 1);
+}
+
+static int pathlen_without_trailing_slash(char *path)
+{
+    int len = (int)strlen(path);
+    while (len > 1 && /* mind "/" as root dir */
+           path[len-1] == DEFAULT_SLASH)
+    {
+        --len;
+    }
+    return len;
+}
+
+static inline char* skip_slash(char *s)
+{
+    while (*s == DEFAULT_SLASH) {
+        ++s;
+    }
+    return s;
+}
+
+/**
+ * Walk down the path_stop starting at path_start.
+ *
+ * If path_start = "/path1" and path_stop = "/path1/path2/path3"
+ * the callback will be called 3 times with the next args:
+ *
+ *   1. "/path1/path2/path3"
+ *             ^ end
+ *       ^ start
+ *   2. "/path1/path2/path3"
+ *                   ^ end
+ *       ^ start
+ *   3. "/path1/path2/path3"
+ *                         ^ end
+ *       ^ start
+ *
+ * path_stop has to be a subdir of path_start
+ * or to be path_start itself.
+ *
+ * Both path args have to be absolute.
+ * Trailing slashes are allowed.
+ * NULL or empty string args are not allowed.
+ */
+static void walk_down_the_path(char* path_start,
+                               char* path_stop,
+                               void (*cb)(char* begin,
+                                          char* end,
+                                          void* data),
+                               void* data)
+{
+    char *pos = path_stop + pathlen_without_trailing_slash(path_start);
+    cb(path_stop, pos, data);
+
+    while ((pos = skip_slash(pos))[0]) {
+        pos = strchr(pos, DEFAULT_SLASH);
+        if (!pos) {
+            /* The last token without trailing slash
+             */
+            cb(path_stop, path_stop + strlen(path_stop), data);
+            return;
+        }
+        cb(path_stop, pos, data);
+    }
+}
+
+typedef struct {
+    char *path;
+    uint path_len;
+    char *doc_root;
+    user_config_cache_entry *entry;
+} _lsapi_activate_user_ini_ctx;
+
+typedef int (*fn_activate_user_ini_chain_t)
+        (_lsapi_activate_user_ini_ctx *ctx, void* next);
+
+static int lsapi_activate_user_ini_basic_checks(_lsapi_activate_user_ini_ctx *ctx,
+                                                void* next)
+{
+    int rc = SUCCESS;
+    fn_activate_user_ini_chain_t *fn_next = next;
+
+    if (!PG(user_ini_filename) || !*PG(user_ini_filename)) {
+        return SUCCESS;
+    }
+
+    /* PATH_TRANSLATED should be defined at this stage */
+    ctx->path = SG(request_info).path_translated;
+    if (!ctx->path || !*ctx->path) {
+        return FAILURE;
+    }
+
+    ctx->doc_root = sapi_lsapi_getenv("DOCUMENT_ROOT", 0);
+
+    if (*fn_next) {
+        rc = (*fn_next)(ctx, fn_next + 1);
+    }
+
+    return rc;
+}
+
+static int lsapi_activate_user_ini_mk_path(_lsapi_activate_user_ini_ctx *ctx,
+                                           void* next)
+{
+    char *path;
+    int rc = SUCCESS;
+    fn_activate_user_ini_chain_t *fn_next = next;
+
+    /* Extract dir name from path_translated * and store it in 'path' */
+    ctx->path_len = strlen(ctx->path);
+    path = ctx->path = estrndup(SG(request_info).path_translated, ctx->path_len);
+    if (!path)
+        return FAILURE;
+    ctx->path_len = zend_dirname(path, ctx->path_len);
+
+    if (*fn_next) {
+        rc = (*fn_next)(ctx, fn_next + 1);
+    }
+
+    efree(path);
+    return rc;
+}
+
+static int lsapi_activate_user_ini_mk_realpath(_lsapi_activate_user_ini_ctx *ctx,
+                                               void* next)
+{
+    char *real_path;
+    int rc = SUCCESS;
+    fn_activate_user_ini_chain_t *fn_next = next;
+
+    if (!IS_ABSOLUTE_PATH(ctx->path, ctx->path_len)) {
+        real_path = tsrm_realpath(ctx->path, NULL);
+        if (!real_path) {
+            return SUCCESS;
+        }
+        ctx->path = real_path;
+        ctx->path_len = strlen(ctx->path);
+    } else {
+        real_path = NULL;
+    }
+
+    if (*fn_next) {
+        rc = (*fn_next)(ctx, fn_next + 1);
+    }
+
+    if (real_path)
+        efree(real_path);
+    return rc;
+}
+
+static int lsapi_activate_user_ini_mk_user_config(_lsapi_activate_user_ini_ctx *ctx,
+                                                  void* next)
+{
+    fn_activate_user_ini_chain_t *fn_next = next;
+
+    ctx->entry = zend_hash_str_find_ptr(&user_config_cache,
+                                        ctx->path,
+                                        ctx->path_len);
+
+    /* Find cached config entry: If not found, create one */
+    if (!ctx->entry) {
+        ctx->entry = pemalloc(sizeof(user_config_cache_entry), 1);
+        ctx->entry->expires = 0;
+        zend_hash_init(&ctx->entry->user_config, 0, NULL, config_zval_dtor, 1);
+        zend_hash_str_update_ptr(&user_config_cache,
+                                 ctx->path,
+                                 ctx->path_len,
+                                 ctx->entry);
+    }
+
+    if (*fn_next) {
+        return (*fn_next)(ctx, fn_next + 1);
+    } else {
+        return SUCCESS;
+    }
+}
+
+static void walk_down_the_path_callback(char* begin,
+                                        char* end,
+                                        void* data)
+{
+    _lsapi_activate_user_ini_ctx *ctx = data;
+    char tmp = end[0];
+    end[0] = 0;
+    php_parse_user_ini_file(begin, PG(user_ini_filename), &ctx->entry->user_config);
+    end[0] = tmp;
+}
+
+static int lsapi_activate_user_ini_walk_down_the_path(_lsapi_activate_user_ini_ctx *ctx,
+                                                      void* next)
+{
+    time_t request_time = sapi_get_request_time();
+    uint path_len, docroot_len;
+    int rc = SUCCESS;
+    fn_activate_user_ini_chain_t *fn_next = next;
+
+    if (!ctx->entry->expires || request_time > ctx->entry->expires)
+    {
+        docroot_len = ctx->doc_root && ctx->doc_root[0]
+                    ? pathlen_without_trailing_slash(ctx->doc_root)
+                    : 0;
+
+        int is_outside_of_docroot = !docroot_len ||
+                ctx->path_len < docroot_len ||
+                strncmp(ctx->path, ctx->doc_root, docroot_len) != 0;
+
+        if (is_outside_of_docroot) {
+            php_parse_user_ini_file(ctx->path, PG(user_ini_filename), &ctx->entry->user_config);
+        } else {
+            walk_down_the_path(ctx->doc_root, ctx->path,
+                               &walk_down_the_path_callback, ctx);
+        }
+
+        ctx->entry->expires = request_time + PG(user_ini_cache_ttl);
+    }
+
+    if (*fn_next) {
+        rc = (*fn_next)(ctx, fn_next + 1);
+    }
+
+    return rc;
+}
+
+static int lsapi_activate_user_ini_finally(_lsapi_activate_user_ini_ctx *ctx,
+                                           void* next)
+{
+    int rc = SUCCESS;
+    fn_activate_user_ini_chain_t *fn_next = next;
+
+    php_ini_activate_config(&ctx->entry->user_config, PHP_INI_PERDIR, PHP_INI_STAGE_HTACCESS);
+
+    if (*fn_next) {
+        rc = (*fn_next)(ctx, fn_next + 1);
+    }
+
+    return rc;
+}
+
+static int lsapi_activate_user_ini()
+{
+    _lsapi_activate_user_ini_ctx ctx;
+    /**
+     * The reason to have this function list stacked
+     * is each function now can define a scoped destructor.
+     *
+     * Passing control via function pointer is a sign of low coupling,
+     * which means dependencies between these functions are to be
+     * controlled from a single place
+     * (here below, by modifying this function list order)
+     */
+    static const fn_activate_user_ini_chain_t fn_chain[] = {
+        &lsapi_activate_user_ini_basic_checks,
+        &lsapi_activate_user_ini_mk_path,
+        &lsapi_activate_user_ini_mk_realpath,
+        &lsapi_activate_user_ini_mk_user_config,
+        &lsapi_activate_user_ini_walk_down_the_path,
+        &lsapi_activate_user_ini_finally,
+        NULL
+    };
+
+    if (parse_user_ini) {
+        return fn_chain[0](&ctx, (fn_activate_user_ini_chain_t*)(fn_chain + 1));
+    } else {
+        /* Parsing of user.ini is disabled, nothing to do. */
+        return SUCCESS;
+    }
+}
 
 static void override_ini()
 {
@@ -1030,6 +1336,11 @@ int main( int argc, char * argv[] )
 
     lsapi_sapi_module.executable_location = argv[0];
 
+    /* Initialize from environment variables before processing command-line
+     * options: the latter override the former.
+     */
+    init_sapi_from_env(&lsapi_sapi_module);
+
     if ( ignore_php_ini )
         lsapi_sapi_module.php_ini_ignore = 1;
 
@@ -1135,6 +1446,12 @@ zend_function_entry litespeed_functions[] = {
 
 static PHP_MINIT_FUNCTION(litespeed)
 {
+    user_config_cache_init();
+
+    const char *p = getenv("LSPHP_ENABLE_USER_INI");
+    if (p && 0 == strcasecmp(p, "on"))
+        parse_user_ini = 1;
+
     /* REGISTER_INI_ENTRIES(); */
     return SUCCESS;
 }
@@ -1142,6 +1459,8 @@ static PHP_MINIT_FUNCTION(litespeed)
 
 static PHP_MSHUTDOWN_FUNCTION(litespeed)
 {
+    zend_hash_destroy(&user_config_cache);
+
     /* UNREGISTER_INI_ENTRIES(); */
     return SUCCESS;
 }
